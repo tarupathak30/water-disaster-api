@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-tensorflow
+torch
 transformers
 scikit-learn
 joblib
 numpy
 pandas
+emoji

@@ -1,107 +1,103 @@
-# app.py
+import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
-import tensorflow as tf
-from transformers import TFAutoModel, AutoTokenizer
-import joblib
-import os
+import torch
+import emoji
+from transformers import AutoTokenizer, AutoModel
 
-# -----------------------
-# Config
-# -----------------------
-MODEL_WEIGHTS_PATH = "model_weights.h5"
-MAX_LEN = 128
-
-ENCODER_PATHS = {
-    "type": "le_type.pkl",
-    "rel": "le_rel.pkl",
-    "urg": "le_urg.pkl"
-}
-
-# -----------------------
-# Load Label Encoders
-# -----------------------
-def load_encoder(path: str):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing encoder: {path}")
-    return joblib.load(path)
-
-le_type = load_encoder(ENCODER_PATHS["type"])
-le_rel  = load_encoder(ENCODER_PATHS["rel"])
-le_urg  = load_encoder(ENCODER_PATHS["urg"])
-
-NUM_TYPE = len(le_type.classes_)
-NUM_REL  = len(le_rel.classes_)
-NUM_URG  = len(le_urg.classes_)
-
-# -----------------------
-# Load tokenizer & model
-# -----------------------
-tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-backbone = TFAutoModel.from_pretrained("distilbert-base-uncased", from_pt=True)
-
-input_ids = tf.keras.layers.Input(shape=(MAX_LEN,), dtype=tf.int32, name="input_ids")
-attention_mask = tf.keras.layers.Input(shape=(MAX_LEN,), dtype=tf.int32, name="attention_mask")
-
-outputs = backbone(input_ids, attention_mask=attention_mask)
-cls_token = outputs.last_hidden_state[:, 0, :]
-x = tf.keras.layers.Dropout(0.2)(cls_token)
-
-type_output = tf.keras.layers.Dense(NUM_TYPE, activation="softmax", name="type_output")(x)
-rel_output  = tf.keras.layers.Dense(NUM_REL, activation="softmax", name="rel_output")(x)
-urg_output  = tf.keras.layers.Dense(NUM_URG, activation="softmax", name="urg_output")(x)
-
-model = tf.keras.Model(inputs=[input_ids, attention_mask],
-                       outputs=[type_output, rel_output, urg_output])
-
-model.load_weights(MODEL_WEIGHTS_PATH)
-
-# -----------------------
-# FastAPI App
-# -----------------------
-app = FastAPI(title="Disaster MultiTask API")
-
-class InputText(BaseModel):
+# -------------------
+# Pydantic model
+# -------------------
+class Tweet(BaseModel):
     text: str
 
-DISASTER_KEYWORDS = [
-    "flood", "hurricane", "cyclone", "storm", "tsunami",
-    "high wave", "tidal", "surge", "landslide", "rain",
-    "evacuate", "warning", "alert", "emergency"
-]
+# -------------------
+# Load tokenizer & BERT
+# -------------------
+model_name = "bert-base-uncased"  
+bert = AutoModel.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+tokenizer.save_pretrained("model/bert-tokenizer")  # optional local save
+
+# -------------------
+# Multi-task heads
+# -------------------
+num_disaster = 7
+num_urgency  = 3
+
+class MultiTaskBERT(torch.nn.Module):
+    def __init__(self, bert, num_disaster, num_urgency):
+        super().__init__()
+        self.bert = bert
+        hidden_size = self.bert.config.hidden_size
+        self.disaster_head = torch.nn.Linear(hidden_size, num_disaster)
+        self.urgency_head   = torch.nn.Linear(hidden_size, num_urgency)
+        self.relevance_head = torch.nn.Linear(hidden_size, 1)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.last_hidden_state[:, 0]
+        return (self.disaster_head(pooled),
+                self.urgency_head(pooled),
+                self.relevance_head(pooled))
+
+# -------------------
+# Initialize model
+# -------------------
+model = MultiTaskBERT(bert, num_disaster, num_urgency)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# -------------------
+# Load checkpoint safely
+# -------------------
+heads = torch.load("multi_task_bert.pth", map_location=device)
+print("Checkpoint keys:", heads.keys())
+
+for head_name in ["disaster_head", "urgency_head", "relevance_head"]:
+    if f"{head_name}.weight" in heads and f"{head_name}.bias" in heads:
+        getattr(model, head_name).weight.data = heads[f"{head_name}.weight"]
+        getattr(model, head_name).bias.data   = heads[f"{head_name}.bias"]
+    else:
+        print(f"Warning: {head_name} not found in checkpoint!")
+
+model.eval()
+
+# -------------------
+# Label mappings
+# -------------------
+disaster_labels = ['flood','hurricane','rain','cyclone','storm','high_waves','casual']
+urgency_labels  = ['neutral','panic','emergency']
+
+# -------------------
+# FastAPI app
+# -------------------
+app = FastAPI(title="Disaster Tweet Classifier")
+
+def preprocess_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return emoji.demojize(text, language="en")
+
+def predict_tweet(text: str) -> dict:
+    inputs = tokenizer(preprocess_text(text), padding=True, truncation=True, max_length=64, return_tensors="pt").to(device)
+    with torch.no_grad():
+        d_logits, u_logits, r_logits = model(inputs['input_ids'], inputs['attention_mask'])
+        disaster_idx = torch.argmax(d_logits, dim=1).item()
+        urgency_idx  = torch.argmax(u_logits, dim=1).item()
+        relevance    = torch.sigmoid(r_logits).item()
+    return {
+        "disaster_type": disaster_labels[disaster_idx],
+        "urgency": urgency_labels[urgency_idx],
+        "relevance": round(relevance, 3)
+    }
 
 @app.post("/predict")
-def predict(data: InputText):
-    text_lower = data.text.lower()
-    if not any(word in text_lower for word in DISASTER_KEYWORDS):
-        return {
-            "text": data.text,
-            "results": {
-                "disaster_type": "casual",
-                "relevance": "0",
-                "urgency": "neutral"
-            }
-        }
+def predict(tweet: Tweet):
+    return predict_tweet(tweet.text)
 
-    tokens = tokenizer(
-        data.text,
-        truncation=True,
-        padding="max_length",
-        max_length=MAX_LEN,
-        return_tensors="tf"
-    )
-
-    outputs = model([tokens["input_ids"], tokens["attention_mask"]])
-
-    type_pred = le_type.inverse_transform([int(tf.argmax(outputs[0], axis=-1))])[0]
-    rel_pred  = le_rel.inverse_transform([int(tf.argmax(outputs[1], axis=-1))])[0]
-    urg_pred  = le_urg.inverse_transform([int(tf.argmax(outputs[2], axis=-1))])[0]
-
-    return {
-        "text": data.text,
-        "results": {
-            "disaster_type": str(type_pred),
-            "relevance": str(rel_pred),
-            "urgency": str(urg_pred)
-        }
-    }
+# -------------------
+# Run server
+# -------------------
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
